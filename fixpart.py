@@ -45,10 +45,24 @@ class Page(HTMLParser):
         self.pages = []
         self.scripts = []
         self.script = None
+        self.listing_depth = 0
+        self.filter_depth = 0
+        self.counter_text = []
+        self.product_cards = 0
         self.feed(html)
 
     def handle_starttag(self, tag, attrs):
         attrs = dict(attrs)
+        classes = (attrs.get("class") or "").split()
+        if tag == "div":
+            if self.listing_depth:
+                self.listing_depth += 1
+            elif "productlist__wrapper" in classes:
+                self.listing_depth = 1
+            if self.listing_depth and attrs.get("id") == "filters":
+                self.filter_depth = self.listing_depth
+        if self.listing_depth and "productlist__item" in classes:
+            self.product_cards += 1
         if tag == "a" and attrs.get("href"):
             self.links.append(attrs["href"])
         if attrs.get("data-page"):
@@ -57,10 +71,16 @@ class Page(HTMLParser):
             self.script = ""
 
     def handle_data(self, data):
+        if self.filter_depth:
+            self.counter_text.append(data)
         if self.script is not None:
             self.script += data
 
     def handle_endtag(self, tag):
+        if tag == "div" and self.listing_depth:
+            if self.listing_depth == self.filter_depth:
+                self.filter_depth = 0
+            self.listing_depth -= 1
         if tag == "script" and self.script is not None:
             self.scripts.append(self.script)
             self.script = None
@@ -69,6 +89,11 @@ class Page(HTMLParser):
 def extract_items(html: str) -> tuple[list[dict], int]:
     """Return the products in this page's ItemList and the highest page number on it."""
     page = Page(html)
+    verified_empty = (
+        " ".join("".join(page.counter_text).split()) == "Filter 0 Ergebnisse"
+        and page.product_cards == 0
+        and max(page.pages, default=1) == 1
+    )
     rows = []
     for blob in page.scripts:
         data = orjson.loads(blob)
@@ -98,7 +123,13 @@ def extract_items(html: str) -> tuple[list[dict], int]:
                     "url": item.get("url", ""),
                 }
             )
+        if not rows and not verified_empty:
+            raise ValueError("Empty ItemList has no explicit zero-result confirmation")
+        if rows and verified_empty:
+            raise ValueError("Zero-result counter contradicts product data")
         return rows, max(page.pages, default=1)
+    if verified_empty:
+        return [], 1
     raise ValueError("Expected catalogue ItemList is absent; page remains pending")
 
 
@@ -284,6 +315,13 @@ async def scrape_combo(
         if response.status_code == 404 or is_parent_redirect:
             if page != 1:
                 raise ValueError("Listing disappeared before advertised final page")
+            rows, max_page = [], 1
+        else:
+            response.raise_for_status()
+            rows, max_page = extract_items(response.text)
+        if not rows:
+            if page != 1:
+                raise ValueError("Zero results before advertised final page")
             with state["db"]:
                 state["db"].execute(
                     "INSERT OR REPLACE INTO progress "
@@ -291,12 +329,10 @@ async def scrape_combo(
                     (brand, category, page, previous_first_sku, expected_last_page),
                 )
             return
-        response.raise_for_status()
-        rows, max_page = extract_items(response.text)
         if page < expected_last_page and max_page < expected_last_page:
             raise ValueError("Pagination disappeared or contradicted the saved final page")
         expected_last_page = max(expected_last_page, max_page)
-        if not rows or rows[0]["sku"] == previous_first_sku:
+        if rows[0]["sku"] == previous_first_sku:
             raise ValueError("Empty or repeated listing before verified completion")
         previous_first_sku = rows[0]["sku"]
 

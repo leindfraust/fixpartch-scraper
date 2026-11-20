@@ -22,6 +22,15 @@ def listing(sku="one", *, pages=1):
     )
 
 
+EMPTY_LISTING = """
+<div class="productlist__wrapper">
+  <h2 class="listing__heading">Bertazzoni 3D-Brille Produkte</h2>
+  <div class="filter-btn" id="filters"><span>Filter 0 Ergebnisse</span></div>
+  <div class="productlist__customerservice"><p>Sie können Ihr Produkt nicht finden?</p></div>
+</div>
+"""
+
+
 class DiscoveryTests(unittest.IsolatedAsyncioTestCase):
     async def test_follows_all_advertised_letter_pages(self):
         pages = {
@@ -70,6 +79,20 @@ class DiscoveryTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ExtractionTests(unittest.TestCase):
+    def test_explicit_zero_result_listing_without_itemlist_is_empty(self):
+        self.assertEqual(fixpart.extract_items(EMPTY_LISTING), ([], 1))
+
+    def test_zero_result_text_outside_listing_is_not_empty_evidence(self):
+        with self.assertRaises(ValueError):
+            fixpart.extract_items("<div>Filter 0 Ergebnisse</div>")
+
+    def test_zero_result_counter_with_product_cards_is_not_empty(self):
+        html = EMPTY_LISTING.replace(
+            '<div class="filter-btn"', '<div class="productlist__item">Product</div><div class="filter-btn"',
+        )
+        with self.assertRaises(ValueError):
+            fixpart.extract_items(html)
+
     def test_missing_itemlist_raises(self):
         with self.assertRaises(ValueError):
             fixpart.extract_items("<html>Access denied</html>")
@@ -182,6 +205,19 @@ class ProgressTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError):
             await self.crawl(lambda r: httpx.Response(200, text="Maintenance"))
         self.assertIsNone(self.progress())
+
+    async def test_verified_empty_first_page_is_complete(self):
+        await self.crawl(lambda r: httpx.Response(200, text=EMPTY_LISTING))
+        self.assertEqual(self.progress(), (1, 1))
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM products").fetchone()[0], 0)
+
+    async def test_zero_results_on_later_page_remain_pending(self):
+        def handler(request):
+            html = listing(pages=3) if request.url.params["page"] == "1" else EMPTY_LISTING
+            return httpx.Response(200, text=html)
+        with self.assertRaises(ValueError):
+            await self.crawl(handler)
+        self.assertEqual(self.progress(), (2, 0))
 
     async def test_known_parent_redirect_marks_absent_listing(self):
         await self.crawl(lambda r: httpx.Response(
