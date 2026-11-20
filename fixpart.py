@@ -142,7 +142,11 @@ class Guard:
 async def get(client: httpx.AsyncClient, url: str, guard: Guard, state: dict) -> httpx.Response | None:
     for _ in range(6):
         await guard.wait()
-        response = await client.get(url)
+        try:
+            response = await client.get(url)
+        except httpx.HTTPError as exc:
+            print(f"network error ({exc.__class__.__name__}), leaving listing pending", flush=True)
+            return None
         if response.status_code == 429:
             print("429 from nginx: pausing 30s", flush=True)
             guard.block(30)
@@ -181,41 +185,40 @@ async def scrape_combo(
     page = 1
     previous_first_sku = None
     max_page = 1
-    try:
-        while page <= max_page:
-            url = BASE + LISTING.format(brand=brand, category=category, page=page)
-            response = await get(client, url, guard, state)
-            if response is None:
-                return
-            if response.status_code != 200:
-                break
-            rows, max_page = extract_items(response.text)
-            if not rows or rows[0]["sku"] == previous_first_sku:
-                break
-            previous_first_sku = rows[0]["sku"]
+    while page <= max_page:
+        url = BASE + LISTING.format(brand=brand, category=category, page=page)
+        response = await get(client, url, guard, state)
+        if response is None:
+            return
+        if response.status_code != 200:
+            break
+        rows, max_page = extract_items(response.text)
+        if not rows or rows[0]["sku"] == previous_first_sku:
+            break
+        previous_first_sku = rows[0]["sku"]
 
-            async with state["lock"]:
-                state["rows"] += save_rows(state["db"], rows)
-                state["db"].commit()
-                state["pages"] += 1
-                if state["rows"] // args.report > state["last_report"]:
-                    state["last_report"] = state["rows"] // args.report
-                    elapsed = time.time() - state["start"]
-                    print(
-                        f"{state['rows']:,} rows | {state['pages']:,} pages | "
-                        f"{state['rows'] / elapsed:,.0f} rows/s | {brand}/{category} p{page}/{max_page}",
-                        flush=True,
-                    )
-            page += 1
-            if args.max_pages and page > args.max_pages:
-                break
-    finally:
         async with state["lock"]:
-            state["db"].execute(
-                "INSERT OR REPLACE INTO combos (brand, category, done) VALUES (?, ?, 1)",
-                (brand, category),
-            )
+            state["rows"] += save_rows(state["db"], rows)
             state["db"].commit()
+            state["pages"] += 1
+            if state["rows"] // args.report > state["last_report"]:
+                state["last_report"] = state["rows"] // args.report
+                elapsed = time.time() - state["start"]
+                print(
+                    f"{state['rows']:,} rows | {state['pages']:,} pages | "
+                    f"{state['rows'] / elapsed:,.0f} rows/s | {brand}/{category} p{page}/{max_page}",
+                    flush=True,
+                )
+        page += 1
+        if args.max_pages and page > args.max_pages:
+            break
+
+    async with state["lock"]:
+        state["db"].execute(
+            "INSERT OR REPLACE INTO combos (brand, category, done) VALUES (?, ?, 1)",
+            (brand, category),
+        )
+        state["db"].commit()
 
 
 async def run(args) -> None:
@@ -232,7 +235,7 @@ async def run(args) -> None:
         cookies=parse_cookie(cookie),
         timeout=httpx.Timeout(args.timeout),
         limits=limits,
-        http2=True,
+        http2=False,
         follow_redirects=False,
         trust_env=True,
     ) as client:
@@ -253,7 +256,7 @@ async def run(args) -> None:
         if args.brands:
             wanted = {b.strip() for b in args.brands.split(",")}
             brands = [b for b in brands if b in wanted]
-        pending = [(b, c) for b in brands for c in categories if (b, c) not in done]
+        pending = [(b, c) for c in categories for b in brands if (b, c) not in done]
         print(
             f"{len(pending):,} listings pending "
             f"({len(done):,} already done of {len(brands) * len(categories):,}), "
