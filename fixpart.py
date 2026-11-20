@@ -42,6 +42,7 @@ class Page(HTMLParser):
         super().__init__()
         self.url = url
         self.links = []
+        self.popular = []
         self.pages = []
         self.scripts = []
         self.script = None
@@ -65,6 +66,8 @@ class Page(HTMLParser):
             self.product_cards += 1
         if tag == "a" and attrs.get("href"):
             self.links.append(attrs["href"])
+            if "blocklist__item--brand" in classes:
+                self.popular.append(attrs["href"])
         if attrs.get("data-page"):
             self.pages.append(int(attrs["data-page"]))
         if tag == "script" and attrs.get("type") == "application/ld+json":
@@ -258,7 +261,13 @@ def listing_slugs(page: Page) -> set[str]:
     return slugs
 
 
-async def discover(client: httpx.AsyncClient, *, guard=None) -> tuple[list[str], list[str]]:
+def order_pending(brands, categories, popular, done):
+    """Popular brands first, so the biggest catalogues land early; coverage is unchanged."""
+    ordered = [b for b in brands if b in popular] + [b for b in brands if b not in popular]
+    return [(b, c) for b in ordered for c in categories if (b, c) not in done]
+
+
+async def discover(client: httpx.AsyncClient, *, guard=None) -> tuple[list[str], list[str], set[str]]:
     guard = guard if guard is not None else Guard(1.6)
     async def load(url):
         response = await get(client, url, guard, {})
@@ -270,6 +279,10 @@ async def discover(client: httpx.AsyncClient, *, guard=None) -> tuple[list[str],
     categories = listing_slugs(await load(BASE + CATEGORIES_PATH))
     directory = await load(BASE + BRANDS_PATH)
     brands = listing_slugs(directory)
+    popular = {
+        urlsplit(urljoin(directory.url, link)).path.rstrip("/").split("/")[-1]
+        for link in directory.popular
+    }
     letter_urls = {
         urljoin(directory.url, link).split("#")[0] for link in directory.links
         if urlsplit(urljoin(directory.url, link)).netloc == "fixpart.ch"
@@ -282,7 +295,7 @@ async def discover(client: httpx.AsyncClient, *, guard=None) -> tuple[list[str],
         brands.update(listing_slugs(await load(url)))
     if not brands or not categories:
         raise ValueError("Empty discovery is not a complete catalogue")
-    return sorted(brands), sorted(categories)
+    return sorted(brands), sorted(categories), popular
 
 
 async def scrape_combo(
@@ -380,14 +393,14 @@ async def run(args) -> None:
         trust_env=True,
     ) as client:
         guard = Guard(args.rate)
-        brands, categories = await discover(client, guard=guard)
+        brands, categories, popular = await discover(client, guard=guard)
         if args.categories:
             wanted = {c.strip() for c in args.categories.split(",")}
             categories = [c for c in categories if c in wanted]
         if args.brands:
             wanted = {b.strip() for b in args.brands.split(",")}
             brands = [b for b in brands if b in wanted]
-        pending = [(b, c) for c in categories for b in brands if (b, c) not in done]
+        pending = order_pending(brands, categories, popular, done)
         print(
             f"{len(pending):,} listings pending "
             f"({len(brands):,} brands x {len(categories):,} categories), "

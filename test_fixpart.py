@@ -47,7 +47,7 @@ class DiscoveryTests(unittest.IsolatedAsyncioTestCase):
                 key += "?" + request.url.query.decode()
             return httpx.Response(200, text=pages[key])
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-            brands, categories = await fixpart.discover(client)
+            brands, categories, _ = await fixpart.discover(client)
         self.assertEqual(brands, ["aeg", "beko"])
         self.assertEqual(categories, ["filter"])
 
@@ -57,6 +57,25 @@ class DiscoveryTests(unittest.IsolatedAsyncioTestCase):
         ) as client:
             with self.assertRaises(httpx.HTTPStatusError):
                 await fixpart.discover(client)
+
+    async def test_discovery_exposes_popular_brands(self):
+        pages = {
+            "/de/produktkategorien": '<a href="/de/ersatzteile/filter">Filter</a>',
+            "/de/marken": (
+                '<a class="blocklist__item blocklist__item--brand" href="/de/ersatzteile/aeg">AEG</a>'
+                '<a href="?letter=B">B</a>'
+            ),
+            "/de/marken?letter=B": '<a href="/de/ersatzteile/beko">Beko</a>',
+        }
+        def handler(request):
+            key = request.url.path
+            if request.url.query:
+                key += "?" + request.url.query.decode()
+            return httpx.Response(200, text=pages[key])
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            brands, categories, popular = await fixpart.discover(client)
+        self.assertEqual(brands, ["aeg", "beko"])
+        self.assertEqual(popular, {"aeg"})
 
     async def test_query_and_document_relative_links_use_document_url(self):
         pages = {
@@ -73,7 +92,7 @@ class DiscoveryTests(unittest.IsolatedAsyncioTestCase):
                 key += "?" + request.url.query.decode()
             return httpx.Response(200, text=pages[key])
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-            brands, categories = await fixpart.discover(client)
+            brands, categories, _ = await fixpart.discover(client)
         self.assertEqual(brands, ["aeg", "beko"])
         self.assertEqual(categories, ["filter"])
 
