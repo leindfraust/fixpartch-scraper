@@ -10,7 +10,7 @@ Pagination is server-side (?page=N, max from data-page).
 
 Products and per-page progress are committed together in fixpart.db.
 Old `combos` flags are not trusted: historical versions marked failures done.
-Captcha responses stop the run; other unexpected responses remain pending.
+Captcha responses stop the run once they are unbroken; a lone gated listing stays pending.
 """
 
 import argparse
@@ -35,6 +35,9 @@ HEADERS = {
     "(KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36",
 }
 FIELDS = ("sku", "title", "price", "currency", "availability", "brand", "mpn", "url")
+# the gate also answers HTTP 200, and a cookie that mostly works is gated on odd listings,
+# so one gate is skipped and only an unbroken run of them means the wall is total
+MAX_CONSECUTIVE_GATES = 20
 
 
 class Page(HTMLParser):
@@ -438,10 +441,18 @@ async def run(args) -> None:
 
 async def crawl_pending(client, pending, *, guard, state, args):
     listings = iter(pending)
+    gates = 0
     async def worker():
+        nonlocal gates
         for brand, category in listings:
             try:
                 await scrape_combo(client, brand, category, guard, state, args)
+                gates = 0
+            except RuntimeError:
+                gates += 1
+                if gates >= MAX_CONSECUTIVE_GATES:
+                    raise
+                print(f"{brand}/{category} gated, left pending", flush=True)
             except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
                 print(f"{brand}/{category} remains pending: {exc}", flush=True)
 

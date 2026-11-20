@@ -159,7 +159,7 @@ class ProgressTests(unittest.IsolatedAsyncioTestCase):
             "db": self.db, "rows": 0, "pages": 0, "lock": asyncio.Lock(),
             "start": 0, "last_report": 0,
         }
-        self.args = SimpleNamespace(max_pages=0, report=10000)
+        self.args = SimpleNamespace(max_pages=0, report=10000, concurrency=2)
         self.guard = fixpart.Guard(1.6)
 
     def tearDown(self):
@@ -317,6 +317,27 @@ class ProgressTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(peak, 2)
         self.assertCountEqual(completed, pending)
+
+    async def test_isolated_gated_listing_does_not_stop_the_batch(self):
+        async def fake_crawl(client, brand, category, guard, state, args):
+            if brand == "gated":
+                raise RuntimeError("Captcha required; run stopped with progress preserved")
+        pending = [("gated", "filter"), ("beko", "filter")]
+        with patch("fixpart.scrape_combo", side_effect=fake_crawl):
+            await fixpart.crawl_pending(
+                None, pending, guard=self.guard, state=self.state, args=self.args,
+            )
+
+    async def test_unbroken_gate_aborts_the_batch(self):
+        async def fake_crawl(client, brand, category, guard, state, args):
+            raise RuntimeError("Captcha required; run stopped with progress preserved")
+        pending = [("a", "filter")] * (fixpart.MAX_CONSECUTIVE_GATES + 1)
+        with patch("fixpart.scrape_combo", side_effect=fake_crawl):
+            with self.assertRaises(ExceptionGroup) as raised:
+                await fixpart.crawl_pending(
+                    None, pending, guard=self.guard, state=self.state, args=self.args,
+                )
+        self.assertIsInstance(raised.exception.exceptions[0], RuntimeError)
 
 
 class GuardTests(unittest.IsolatedAsyncioTestCase):
