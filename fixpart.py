@@ -49,6 +49,7 @@ class Page(HTMLParser):
         self.pages = []
         self.scripts = []
         self.script = None
+        self.is_listing = False
         self.listing_depth = 0
         self.filter_depth = 0
         self.counter_text = []
@@ -63,6 +64,7 @@ class Page(HTMLParser):
                 self.listing_depth += 1
             elif "productlist__wrapper" in classes:
                 self.listing_depth = 1
+                self.is_listing = True
             if self.listing_depth and attrs.get("id") == "filters":
                 self.filter_depth = self.listing_depth
         if self.listing_depth and "productlist__item" in classes:
@@ -140,6 +142,55 @@ def extract_items(html: str) -> tuple[list[dict], int]:
     if verified_empty:
         return [], 1
     raise ValueError("Expected catalogue ItemList is absent; page remains pending")
+
+
+def process_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+        handle = ctypes.windll.kernel32.OpenProcess(0x00100000, False, pid)
+        if not handle:
+            return False
+        ctypes.windll.kernel32.CloseHandle(handle)
+        return True
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def acquire_lock(path: str, pid: int | None = None) -> bool:
+    """One crawler per database. A lock held by a dead PID is reclaimed."""
+    pid = pid or os.getpid()
+    for _ in range(2):
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, str(pid).encode())
+            os.close(fd)
+            return True
+        except FileExistsError:
+            try:
+                holder = int(open(path, encoding="utf-8").read().strip())
+            except (OSError, ValueError):
+                holder = 0
+            if process_alive(holder):
+                return False
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+    return False
+
+
+def release_lock(path: str, pid: int | None = None) -> None:
+    pid = pid or os.getpid()
+    try:
+        if int(open(path, encoding="utf-8").read().strip()) == pid:
+            os.remove(path)
+    except (OSError, ValueError):
+        pass
 
 
 def open_db(path: str) -> sqlite3.Connection:
@@ -337,10 +388,15 @@ async def scrape_combo(
             rows, max_page = [], 1
         else:
             response.raise_for_status()
-            rows, max_page = extract_items(response.text)
+            try:
+                rows, max_page = extract_items(response.text)
+            except ValueError:
+                # The final page of a long listing renders cards without JSON-LD.
+                if page > 1 and Page(response.text).is_listing:
+                    rows, max_page = [], expected_last_page
+                else:
+                    raise
         if not rows:
-            if page != 1:
-                raise ValueError("Zero results before advertised final page")
             with state["db"]:
                 state["db"].execute(
                     "INSERT OR REPLACE INTO progress "
@@ -383,6 +439,12 @@ async def run(args) -> None:
     db = open_db(args.db)
     if args.export:
         export(db, args.export)
+        db.close()
+        return
+
+    lock = os.path.join(os.path.dirname(os.path.abspath(args.db)), args.lock)
+    if not acquire_lock(lock):
+        print("another collector already holds the lock; exiting", flush=True)
         db.close()
         return
 
@@ -464,6 +526,7 @@ async def crawl_pending(client, pending, *, guard, state, args):
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--db", default="fixpart.db")
+    parser.add_argument("--lock", default="fixpart.lock")
     parser.add_argument("--export", default="", help="dump the DB to .csv or .jsonl and exit")
     parser.add_argument("--concurrency", type=int, default=2)
     parser.add_argument("--rate", type=float, default=1.6, help="requests per second across all tasks")

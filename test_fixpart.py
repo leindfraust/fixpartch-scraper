@@ -247,13 +247,12 @@ class ProgressTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.progress(), (1, 1))
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM products").fetchone()[0], 0)
 
-    async def test_zero_results_on_later_page_remain_pending(self):
+    async def test_zero_results_on_later_page_completes_the_listing(self):
         def handler(request):
             html = listing(pages=3) if request.url.params["page"] == "1" else EMPTY_LISTING
             return httpx.Response(200, text=html)
-        with self.assertRaises(ValueError):
-            await self.crawl(handler)
-        self.assertEqual(self.progress(), (2, 0))
+        await self.crawl(handler)
+        self.assertEqual(self.progress(), (2, 1))
 
     async def test_known_parent_redirect_marks_absent_listing(self):
         await self.crawl(lambda r: httpx.Response(
