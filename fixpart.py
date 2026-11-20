@@ -91,6 +91,9 @@ class Page(HTMLParser):
 
 def extract_items(html: str) -> tuple[list[dict], int]:
     """Return the products in this page's ItemList and the highest page number on it."""
+    if 'id="confirmIsHuman"' in html:
+        # the gate answers HTTP 200, so only the body tells it apart from a real page
+        raise RuntimeError("Captcha required; run stopped with progress preserved")
     page = Page(html)
     verified_empty = (
         " ".join("".join(page.counter_text).split()) == "Filter 0 Ergebnisse"

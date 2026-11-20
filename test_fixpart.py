@@ -31,6 +31,19 @@ EMPTY_LISTING = """
 """
 
 
+GATE_PAGE = """
+<div class="fp-modal fp-modal--no-close">
+  <form action="?" method="post" id="confirmIsHuman">
+    <p>Es wurde eine ungewöhnliche Aktivität Ihres Browsers festgestellt.</p>
+    <div class="g-recaptcha" data-sitekey="test" data-size="invisible"></div>
+    <button class="confirm-box-is-human btn-green" name="submitButton">
+      Bestätigen Sie, dass Sie ein Mensch sind
+    </button>
+  </form>
+</div>
+"""
+
+
 class DiscoveryTests(unittest.IsolatedAsyncioTestCase):
     async def test_follows_all_advertised_letter_pages(self):
         pages = {
@@ -115,6 +128,10 @@ class ExtractionTests(unittest.TestCase):
     def test_missing_itemlist_raises(self):
         with self.assertRaises(ValueError):
             fixpart.extract_items("<html>Access denied</html>")
+
+    def test_served_human_confirmation_page_stops_the_run(self):
+        with self.assertRaises(RuntimeError):
+            fixpart.extract_items(GATE_PAGE)
 
     def test_missing_sku_raises(self):
         with self.assertRaises(ValueError):
@@ -256,6 +273,11 @@ class ProgressTests(unittest.IsolatedAsyncioTestCase):
             await self.crawl(lambda r: httpx.Response(
                 302, headers={"location": "/de/captcha?redirect=somewhere"},
             ))
+        self.assertIsNone(self.progress())
+
+    async def test_served_captcha_page_stops_without_marking_done(self):
+        with self.assertRaises(RuntimeError):
+            await self.crawl(lambda r: httpx.Response(200, text=GATE_PAGE))
         self.assertIsNone(self.progress())
 
     async def test_untrusted_legacy_done_flag_does_not_skip_work(self):
