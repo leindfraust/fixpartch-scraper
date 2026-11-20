@@ -1,27 +1,37 @@
 # fixpartch-scraper
 
-Scrapes every product title and price from fixpart.ch into SQLite, resumably.
+Collects product titles and prices from FixPart.ch brand/category listings into
+SQLite. Coverage and the total accessible catalogue size are not yet established.
 
-Each category listing embeds a schema.org `ItemList` in JSON-LD, so one GET returns
-25 complete products (title, price, currency, availability, brand, MPN, URL). No
-browser, no product-page crawl, no HTML selectors.
+Listing pages embed a schema.org `ItemList` in JSON-LD, typically with 25 products
+(title, price, currency, availability, brand, MPN, URL). Extraction requires a SKU,
+title, currency and valid price; unexpected pages remain pending.
 
 ## Run
 
 ```bash
 export FIXPART_COOKIE='<cookie header from a browser session>'
-uv run fixpart.py --db fixpart.db --rate 1.5 --concurrency 2
+uv run fixpart.py --db fixpart.db
 ```
 
-The site rate-limits at roughly 100 requests/minute per IP and answers `429` above
-it. 1.5 req/s (90/min) is the highest rate measured clean; a `429` parks the run for
-30 s. A `302` to `/captcha` means the browser session expired — solve it once by hand
-and copy the cookie again.
+Defaults are 1.6 request starts/second and two workers, including discovery.
+These are operating settings, not a verified site allowance or a guarantee against
+throttling. A 429 pauses future requests using Retry-After when supplied, otherwise
+the existing 30-second fallback. Already in-flight requests cannot be recalled.
+Captcha responses stop the run with progress preserved. No captcha automation,
+proxy rotation or access-control bypass is included. Keep credentials out of git.
 
 ## Resume
 
-Progress is durable: `products` is keyed by SKU, `combos` records finished
-brand/category listings. Re-running the same command skips what is done.
+Products and the next-page cursor are committed in one transaction per page.
+Re-running skips verified complete listings and resumes partial ones at their
+saved page. Server errors, extraction failures and page-capped tests do not
+mark a listing complete. Existing product prices are refreshed on rediscovery.
+
+**Upgrading older databases:** products are retained, but the old `combos` table's
+completion flags are ignored because earlier versions could mark failed or
+cancelled work complete. The new `progress` table starts unverified; old pages
+must be revisited. Back up your database before upgrading.
 
 ```bash
 uv run fixpart.py --db fixpart.db                 # continue
@@ -35,13 +45,25 @@ CREATE TABLE products (
   sku TEXT PRIMARY KEY, title TEXT, price TEXT, currency TEXT,
   availability TEXT, brand TEXT, mpn TEXT, url TEXT
 );
-CREATE TABLE combos (
-  brand TEXT, category TEXT, done INTEGER DEFAULT 0,
+CREATE TABLE progress (
+  brand TEXT, category TEXT, next_page INTEGER NOT NULL, last_sku TEXT,
+  done INTEGER NOT NULL, max_page INTEGER NOT NULL DEFAULT 1,
   PRIMARY KEY (brand, category)
 );
 ```
 
 ## Scope
 
-53,250 listings = 142 brands × 375 categories, paginated at 25 products/page.
-The crawl is deliberately serialised at ~90 pages/min to stay under the limiter.
+Discovery follows all advertised alphabet/number pages, not just the default
+A-brand directory and featured brands. A live audit found 1,512 brand slugs across
+27 directory pages and 375 category slugs, giving 567,000 candidate combinations.
+Many combinations do not exist; others have multiple pages or overlapping products.
+These counts do not establish a unique-product total or prove exhaustive coverage.
+
+## Tests
+
+```bash
+uv run --with httpx --with orjson python -m unittest -v
+```
+
+Tests use in-memory SQLite and HTTPX MockTransport; they do not contact FixPart.

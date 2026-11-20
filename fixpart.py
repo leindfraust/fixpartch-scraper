@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["httpx[http2]>=0.28", "orjson>=3.10"]
+# dependencies = ["httpx>=0.28", "orjson>=3.10"]
 # ///
 """Scrape every FixPart.ch product title + price into SQLite, resumably.
 
@@ -8,20 +8,20 @@ Each listing page embeds a schema.org ItemList (25 products) with name, price,
 currency, availability, brand and URL, so one GET yields 25 complete rows.
 Pagination is server-side (?page=N, max from data-page).
 
-Progress lives in fixpart.db: rows in `products` (sku is the key) and finished
-listings in `combos`, so a restart continues where the last one stopped.
-A 302 to /captcha means the hand-passed session died; a 302 anywhere else is
-just an unknown brand/category slug and is skipped.
+Products and per-page progress are committed together in fixpart.db.
+Old `combos` flags are not trusted: historical versions marked failures done.
+Captcha responses stop the run; other unexpected responses remain pending.
 """
 
 import argparse
 import asyncio
 import csv
 import os
-import re
 import sqlite3
-import sys
 import time
+from decimal import Decimal, InvalidOperation
+from html.parser import HTMLParser
+from urllib.parse import urljoin, urlsplit, parse_qs
 
 import httpx
 import orjson
@@ -34,32 +34,63 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36",
 }
-LD_JSON = re.compile(r'<script type="application/ld\+json">(.*?)</script>', re.S)
-LISTING_LINK = re.compile(r'href="https://fixpart\.ch/de/ersatzteile/([a-z0-9-]+)"')
-MAX_PAGE = re.compile(r'data-page="(\d+)"')
 FIELDS = ("sku", "title", "price", "currency", "availability", "brand", "mpn", "url")
+
+
+class Page(HTMLParser):
+    def __init__(self, html: str, *, url=BASE):
+        super().__init__()
+        self.url = url
+        self.links = []
+        self.pages = []
+        self.scripts = []
+        self.script = None
+        self.feed(html)
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if tag == "a" and attrs.get("href"):
+            self.links.append(attrs["href"])
+        if attrs.get("data-page"):
+            self.pages.append(int(attrs["data-page"]))
+        if tag == "script" and attrs.get("type") == "application/ld+json":
+            self.script = ""
+
+    def handle_data(self, data):
+        if self.script is not None:
+            self.script += data
+
+    def handle_endtag(self, tag):
+        if tag == "script" and self.script is not None:
+            self.scripts.append(self.script)
+            self.script = None
 
 
 def extract_items(html: str) -> tuple[list[dict], int]:
     """Return the products in this page's ItemList and the highest page number on it."""
+    page = Page(html)
     rows = []
-    for blob in LD_JSON.findall(html):
-        try:
-            data = orjson.loads(blob)
-        except orjson.JSONDecodeError:
-            continue
+    for blob in page.scripts:
+        data = orjson.loads(blob)
         if data.get("@type") != "ItemList":
             continue
-        for entry in data.get("itemListElement", []):
-            item = entry.get("item")
-            if not item:
-                continue
-            offer = item.get("offers") or {}
+        for entry in data["itemListElement"]:
+            item = entry["item"]
+            offer = item["offers"]
+            required = (item.get("sku"), item.get("name"), offer.get("priceCurrency"))
+            if not all(isinstance(value, str) and value.strip() for value in required):
+                raise ValueError("Product is missing SKU, title, or currency")
+            try:
+                price = Decimal(str(offer["price"]))
+            except (KeyError, InvalidOperation) as exc:
+                raise ValueError("Product price is missing or malformed") from exc
+            if not price.is_finite() or price < 0:
+                raise ValueError("Product price must be finite and nonnegative")
             rows.append(
                 {
                     "sku": item.get("sku", ""),
                     "title": item.get("name", ""),
-                    "price": offer.get("price", ""),
+                    "price": str(price),
                     "currency": offer.get("priceCurrency", ""),
                     "availability": (offer.get("availability") or "").rsplit("/", 1)[-1],
                     "brand": (item.get("brand") or {}).get("name", ""),
@@ -67,9 +98,8 @@ def extract_items(html: str) -> tuple[list[dict], int]:
                     "url": item.get("url", ""),
                 }
             )
-        break
-    pages = [int(n) for n in MAX_PAGE.findall(html)]
-    return rows, (max(pages) if pages else 1)
+        return rows, max(page.pages, default=1)
+    raise ValueError("Expected catalogue ItemList is absent; page remains pending")
 
 
 def open_db(path: str) -> sqlite3.Connection:
@@ -82,9 +112,14 @@ def open_db(path: str) -> sqlite3.Connection:
         "availability TEXT, brand TEXT, mpn TEXT, url TEXT)"
     )
     db.execute(
-        "CREATE TABLE IF NOT EXISTS combos ("
-        "brand TEXT, category TEXT, done INTEGER DEFAULT 0, PRIMARY KEY (brand, category))"
+        "CREATE TABLE IF NOT EXISTS progress ("
+        "brand TEXT, category TEXT, next_page INTEGER NOT NULL, last_sku TEXT, "
+        "done INTEGER NOT NULL, max_page INTEGER NOT NULL DEFAULT 1, "
+        "PRIMARY KEY (brand, category))"
     )
+    columns = {row[1] for row in db.execute("PRAGMA table_info(progress)")}
+    if "max_page" not in columns:
+        db.execute("ALTER TABLE progress ADD COLUMN max_page INTEGER NOT NULL DEFAULT 1")
     db.commit()
     return db
 
@@ -98,7 +133,13 @@ def save_rows(db: sqlite3.Connection, rows: list[dict]) -> int:
         "VALUES (:sku, :title, :price, :currency, :availability, :brand, :mpn, :url)",
         rows,
     )
-    return db.total_changes - before
+    inserted = db.total_changes - before
+    db.executemany(
+        "UPDATE products SET title=:title, price=:price, currency=:currency, "
+        "availability=:availability, brand=:brand, mpn=:mpn, url=:url WHERE sku=:sku",
+        rows,
+    )
+    return inserted
 
 
 def export(db: sqlite3.Connection, path: str) -> None:
@@ -129,11 +170,13 @@ class Guard:
 
     async def wait(self) -> None:
         async with self.lock:
-            start = max(time.monotonic(), self.next_at, self.blocked_until)
-            self.next_at = start + self.interval
-        delay = start - time.monotonic()
-        if delay > 0:
-            await asyncio.sleep(delay)
+            while True:
+                now = time.monotonic()
+                delay = max(self.next_at, self.blocked_until) - now
+                if delay <= 0:
+                    self.next_at = now + self.interval
+                    return
+                await asyncio.sleep(delay)
 
     def block(self, seconds: float) -> None:
         self.blocked_until = max(self.blocked_until, time.monotonic() + seconds)
@@ -148,12 +191,19 @@ async def get(client: httpx.AsyncClient, url: str, guard: Guard, state: dict) ->
             print(f"network error ({exc.__class__.__name__}), leaving listing pending", flush=True)
             return None
         if response.status_code == 429:
-            print("429 from nginx: pausing 30s", flush=True)
-            guard.block(30)
+            delay = 30
+            retry_after = response.headers.get("retry-after")
+            if retry_after:
+                from email.utils import parsedate_to_datetime
+                try:
+                    delay = float(retry_after)
+                except ValueError:
+                    delay = max(0, parsedate_to_datetime(retry_after).timestamp() - time.time())
+            print(f"HTTP 429: global cooldown {delay}s", flush=True)
+            guard.block(delay)
             continue
-        if response.status_code == 302 and "captcha" in (response.headers.get("location") or ""):
-            state["db"].commit()
-            sys.exit("session challenged again (302 -> /captcha); solve the captcha and re-copy the cookie")
+        if "captcha" in urlsplit(urljoin(url, response.headers.get("location", ""))).path:
+            raise RuntimeError("Captcha required; run stopped with progress preserved")
         return response
     return None
 
@@ -167,11 +217,41 @@ def parse_cookie(raw: str) -> dict[str, str]:
     return jar
 
 
-async def discover(client: httpx.AsyncClient) -> tuple[list[str], list[str]]:
-    categories = sorted(set(LISTING_LINK.findall((await client.get(BASE + CATEGORIES_PATH)).text)))
-    brand_page = (await client.get(BASE + BRANDS_PATH)).text
-    brands = sorted(set(LISTING_LINK.findall(brand_page)) - set(categories))
-    return brands, categories
+def listing_slugs(page: Page) -> set[str]:
+    slugs = set()
+    for link in page.links:
+        url = urlsplit(urljoin(page.url, link))
+        parts = url.path.strip("/").split("/")
+        if url.netloc == "fixpart.ch" and len(parts) == 3 and parts[:2] == ["de", "ersatzteile"]:
+            slugs.add(parts[2])
+    return slugs
+
+
+async def discover(client: httpx.AsyncClient, *, guard=None) -> tuple[list[str], list[str]]:
+    guard = guard if guard is not None else Guard(1.6)
+    async def load(url):
+        response = await get(client, url, guard, {})
+        if response is None:
+            raise RuntimeError("Discovery request failed; cannot establish scope")
+        response.raise_for_status()
+        return Page(response.text, url=str(response.url))
+
+    categories = listing_slugs(await load(BASE + CATEGORIES_PATH))
+    directory = await load(BASE + BRANDS_PATH)
+    brands = listing_slugs(directory)
+    letter_urls = {
+        urljoin(directory.url, link).split("#")[0] for link in directory.links
+        if urlsplit(urljoin(directory.url, link)).netloc == "fixpart.ch"
+        and urlsplit(urljoin(directory.url, link)).path == BRANDS_PATH
+        and "letter" in parse_qs(urlsplit(link).query)
+    }
+    if not letter_urls:
+        raise ValueError("Brand directory has no alphabet navigation")
+    for url in sorted(letter_urls):
+        brands.update(listing_slugs(await load(url)))
+    if not brands or not categories:
+        raise ValueError("Empty discovery is not a complete catalogue")
+    return sorted(brands), sorted(categories)
 
 
 async def scrape_combo(
@@ -182,24 +262,54 @@ async def scrape_combo(
     state: dict,
     args,
 ) -> None:
-    page = 1
-    previous_first_sku = None
-    max_page = 1
-    while page <= max_page:
+    checkpoint = state["db"].execute(
+        "SELECT next_page, last_sku, done, max_page FROM progress WHERE brand=? AND category=?",
+        (brand, category),
+    ).fetchone()
+    if checkpoint and checkpoint[2]:
+        return
+    page, previous_first_sku = checkpoint[:2] if checkpoint else (1, None)
+    expected_last_page = checkpoint[3] if checkpoint else 1
+    while True:
         url = BASE + LISTING.format(brand=brand, category=category, page=page)
         response = await get(client, url, guard, state)
         if response is None:
             return
-        if response.status_code != 200:
-            break
+        destination = urlsplit(urljoin(url, response.headers.get("location", "")))
+        is_parent_redirect = (
+            page == 1 and response.status_code in (301, 302)
+            and destination.netloc == "fixpart.ch"
+            and destination.path == f"/de/ersatzteile/{brand}"
+        )
+        if response.status_code == 404 or is_parent_redirect:
+            if page != 1:
+                raise ValueError("Listing disappeared before advertised final page")
+            with state["db"]:
+                state["db"].execute(
+                    "INSERT OR REPLACE INTO progress "
+                    "(brand, category, next_page, last_sku, done, max_page) VALUES (?, ?, ?, ?, 1, ?)",
+                    (brand, category, page, previous_first_sku, expected_last_page),
+                )
+            return
+        response.raise_for_status()
         rows, max_page = extract_items(response.text)
+        if page < expected_last_page and max_page < expected_last_page:
+            raise ValueError("Pagination disappeared or contradicted the saved final page")
+        expected_last_page = max(expected_last_page, max_page)
         if not rows or rows[0]["sku"] == previous_first_sku:
-            break
+            raise ValueError("Empty or repeated listing before verified completion")
         previous_first_sku = rows[0]["sku"]
 
         async with state["lock"]:
-            state["rows"] += save_rows(state["db"], rows)
-            state["db"].commit()
+            done = page >= expected_last_page
+            with state["db"]:
+                inserted = save_rows(state["db"], rows)
+                state["db"].execute(
+                    "INSERT OR REPLACE INTO progress "
+                    "(brand, category, next_page, last_sku, done, max_page) VALUES (?, ?, ?, ?, ?, ?)",
+                    (brand, category, page + 1, previous_first_sku, int(done), expected_last_page),
+                )
+            state["rows"] += inserted
             state["pages"] += 1
             if state["rows"] // args.report > state["last_report"]:
                 state["last_report"] = state["rows"] // args.report
@@ -210,24 +320,18 @@ async def scrape_combo(
                     flush=True,
                 )
         page += 1
-        if args.max_pages and page > args.max_pages:
-            break
-
-    async with state["lock"]:
-        state["db"].execute(
-            "INSERT OR REPLACE INTO combos (brand, category, done) VALUES (?, ?, 1)",
-            (brand, category),
-        )
-        state["db"].commit()
+        if done or (args.max_pages and page > args.max_pages):
+            return
 
 
 async def run(args) -> None:
     db = open_db(args.db)
     if args.export:
         export(db, args.export)
+        db.close()
         return
 
-    done = {row for row in db.execute("SELECT brand, category FROM combos WHERE done = 1")}
+    done = {row for row in db.execute("SELECT brand, category FROM progress WHERE done = 1")}
     cookie = args.cookie or os.environ.get("FIXPART_COOKIE", "")
     limits = httpx.Limits(max_connections=args.concurrency, max_keepalive_connections=args.concurrency)
     async with httpx.AsyncClient(
@@ -239,17 +343,8 @@ async def run(args) -> None:
         follow_redirects=False,
         trust_env=True,
     ) as client:
-        for _ in range(10):
-            probe = await client.get(BASE + CATEGORIES_PATH)
-            if probe.status_code == 200:
-                break
-            if probe.status_code == 302 and "captcha" in (probe.headers.get("location") or ""):
-                sys.exit("session challenged (302 -> /captcha); solve the captcha and re-copy the cookie")
-            print(f"startup: HTTP {probe.status_code}, retrying in 60s", flush=True)
-            await asyncio.sleep(60)
-        else:
-            sys.exit(f"cannot reach {BASE} after 10 tries (last HTTP {probe.status_code})")
-        brands, categories = await discover(client)
+        guard = Guard(args.rate)
+        brands, categories = await discover(client, guard=guard)
         if args.categories:
             wanted = {c.strip() for c in args.categories.split(",")}
             categories = [c for c in categories if c in wanted]
@@ -259,11 +354,12 @@ async def run(args) -> None:
         pending = [(b, c) for c in categories for b in brands if (b, c) not in done]
         print(
             f"{len(pending):,} listings pending "
-            f"({len(done):,} already done of {len(brands) * len(categories):,}), "
+            f"({len(brands):,} brands x {len(categories):,} categories), "
             f"concurrency {args.concurrency}, rate {args.rate}/s",
             flush=True,
         )
         if not pending:
+            db.close()
             return
 
         state = {
@@ -274,25 +370,40 @@ async def run(args) -> None:
             "start": time.time(),
             "last_report": 0,
         }
-        guard = Guard(args.rate)
-        await asyncio.gather(
-            *(scrape_combo(client, b, c, guard, state, args) for b, c in pending)
-        )
+        await crawl_pending(client, pending, guard=guard, state=state, args=args)
         elapsed = time.time() - state["start"]
         total = db.execute("SELECT COUNT(*) FROM products").fetchone()[0]
+        verified = set(db.execute("SELECT brand, category FROM progress WHERE done = 1"))
+        remaining = sum(pair not in verified for pair in pending)
         print(
             f"batch done: +{state['rows']:,} new rows, {state['pages']:,} pages "
-            f"in {elapsed / 60:.1f} min, {total:,} products in {args.db}",
+            f"in {elapsed / 60:.1f} min, {total:,} products in {args.db}; "
+            f"{remaining:,} listings still pending",
             flush=True,
         )
+    db.close()
+
+
+async def crawl_pending(client, pending, *, guard, state, args):
+    listings = iter(pending)
+    async def worker():
+        for brand, category in listings:
+            try:
+                await scrape_combo(client, brand, category, guard, state, args)
+            except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
+                print(f"{brand}/{category} remains pending: {exc}", flush=True)
+
+    async with asyncio.TaskGroup() as group:
+        for _ in range(args.concurrency):
+            group.create_task(worker())
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--db", default="fixpart.db")
     parser.add_argument("--export", default="", help="dump the DB to .csv or .jsonl and exit")
-    parser.add_argument("--concurrency", type=int, default=8)
-    parser.add_argument("--rate", type=float, default=8, help="requests per second across all tasks")
+    parser.add_argument("--concurrency", type=int, default=2)
+    parser.add_argument("--rate", type=float, default=1.6, help="requests per second across all tasks")
     parser.add_argument("--timeout", type=float, default=30)
     parser.add_argument("--report", type=int, default=10_000)
     parser.add_argument("--cookie", default="", help="Cookie header; defaults to $FIXPART_COOKIE")
@@ -300,6 +411,10 @@ def main() -> None:
     parser.add_argument("--categories", default="", help="comma separated, for a smoke test")
     parser.add_argument("--max-pages", type=int, default=0, help="0 = all pages")
     args = parser.parse_args()
+    if args.concurrency <= 0 or args.rate <= 0 or args.timeout <= 0 or args.report <= 0:
+        parser.error("concurrency, rate, timeout, and report must be positive")
+    if args.max_pages < 0:
+        parser.error("max-pages must be nonnegative")
     asyncio.run(run(args))
 
 
