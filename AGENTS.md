@@ -20,6 +20,9 @@ uv run fixpart.py --db fixpart.db --export products.csv
   never commit it, never log it.
 - Defaults are already 1.6 req/s and 2 workers. Do not raise them without new measurements.
 - `--export` never takes the crawl lock, so it is safe while a crawl is running.
+- `--order-by-size` measures every brand page once (cached in `brand_sizes`) and crawls the
+  largest catalogues first. Use it when the goal is product volume sooner rather than full
+  alphabetical coverage first.
 - `--max-pages N` limits pages per listing; a page-capped listing stays pending and resumes
   at the saved page.
 - `--brands a,b --categories x,y` narrows a run for smoke tests.

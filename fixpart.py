@@ -17,6 +17,7 @@ import argparse
 import asyncio
 import csv
 import os
+import re
 import sqlite3
 import time
 from decimal import Decimal, InvalidOperation
@@ -203,6 +204,10 @@ def open_db(path: str) -> sqlite3.Connection:
         "availability TEXT, brand TEXT, mpn TEXT, url TEXT)"
     )
     db.execute(
+        "CREATE TABLE IF NOT EXISTS brand_sizes ("
+        "brand TEXT PRIMARY KEY, products INTEGER NOT NULL, checked_at INTEGER NOT NULL)"
+    )
+    db.execute(
         "CREATE TABLE IF NOT EXISTS progress ("
         "brand TEXT, category TEXT, next_page INTEGER NOT NULL, last_sku TEXT, "
         "done INTEGER NOT NULL, max_page INTEGER NOT NULL DEFAULT 1, "
@@ -318,9 +323,51 @@ def listing_slugs(page: Page) -> set[str]:
     return slugs
 
 
-def order_pending(brands, categories, popular, done):
-    """Popular brands first, so the biggest catalogues land early; coverage is unchanged."""
-    ordered = [b for b in brands if b in popular] + [b for b in brands if b not in popular]
+BRAND_SIZE = re.compile(r"mehr als\s+([\d\u2019'.,\s]+?)\s*Produkte", re.I)
+
+
+def parse_brand_size(html: str) -> int | None:
+    """Read the brand page's stated catalogue size, e.g. 'mehr als 4’604 Produkte'."""
+    match = BRAND_SIZE.search(html)
+    if not match:
+        return None
+    digits = "".join(ch for ch in match.group(1) if ch.isdigit())
+    return int(digits) if digits else None
+
+
+def save_brand_size(db: sqlite3.Connection, brand: str, products: int) -> None:
+    db.execute(
+        "INSERT OR REPLACE INTO brand_sizes (brand, products, checked_at) VALUES (?, ?, ?)",
+        (brand, products, int(time.time())),
+    )
+    db.commit()
+
+
+def read_brand_sizes(db: sqlite3.Connection) -> dict[str, int]:
+    return dict(db.execute("SELECT brand, products FROM brand_sizes"))
+
+
+async def measure_brands(client, guard, db, brands: list[str]) -> dict[str, int]:
+    sizes = read_brand_sizes(db)
+    missing = [b for b in brands if b not in sizes]
+    for index, brand in enumerate(missing, 1):
+        response = await get(client, f"{BASE}/de/ersatzteile/{brand}", guard, {"db": db})
+        if response is None or response.status_code != 200:
+            continue
+        size = parse_brand_size(response.text) or 0
+        save_brand_size(db, brand, size)
+        sizes[brand] = size
+        if index % 100 == 0:
+            print(f"measured {index}/{len(missing)} brands", flush=True)
+    return sizes
+
+
+def order_pending(brands, categories, popular, done, sizes=None):
+    """Biggest catalogues first when sizes are known, otherwise popular brands first."""
+    if sizes:
+        ordered = sorted(brands, key=lambda b: (-sizes.get(b, 0), b))
+    else:
+        ordered = [b for b in brands if b in popular] + [b for b in brands if b not in popular]
     return [(b, c) for b in ordered for c in categories if (b, c) not in done]
 
 
@@ -468,7 +515,12 @@ async def run(args) -> None:
         if args.brands:
             wanted = {b.strip() for b in args.brands.split(",")}
             brands = [b for b in brands if b in wanted]
-        pending = order_pending(brands, categories, popular, done)
+        sizes = None
+        if args.order_by_size:
+            sizes = await measure_brands(client, guard, db, brands)
+            top = sorted(sizes.items(), key=lambda item: -item[1])[:5]
+            print(f"brand sizes: " + ", ".join(f"{b}={n}" for b, n in top), flush=True)
+        pending = order_pending(brands, categories, popular, done, sizes=sizes)
         print(
             f"{len(pending):,} listings pending "
             f"({len(brands):,} brands x {len(categories):,} categories), "
@@ -533,6 +585,7 @@ def main() -> None:
     parser.add_argument("--timeout", type=float, default=30)
     parser.add_argument("--report", type=int, default=10_000)
     parser.add_argument("--cookie", default="", help="Cookie header; defaults to $FIXPART_COOKIE")
+    parser.add_argument("--order-by-size", action="store_true", help="crawl the biggest catalogues first")
     parser.add_argument("--brands", default="", help="comma separated, for a smoke test")
     parser.add_argument("--categories", default="", help="comma separated, for a smoke test")
     parser.add_argument("--max-pages", type=int, default=0, help="0 = all pages")

@@ -14,6 +14,15 @@ export FIXPART_COOKIE='<cookie header from a browser session>'
 uv run fixpart.py --db fixpart.db
 ```
 
+To get volume early, measure every brand page once (~16 min) and crawl the biggest
+catalogues first instead of alphabetically:
+
+```bash
+uv run fixpart.py --db fixpart.db --order-by-size
+```
+
+Sizes are cached in `brand_sizes`, so later runs reuse them.
+
 Defaults are 1.6 request starts/second and two workers, including discovery.
 These are operating settings, not a verified site allowance or a guarantee against
 throttling. A 429 pauses future requests using Retry-After when supplied, otherwise
