@@ -208,6 +208,10 @@ def open_db(path: str) -> sqlite3.Connection:
         "brand TEXT PRIMARY KEY, products INTEGER NOT NULL, checked_at INTEGER NOT NULL)"
     )
     db.execute(
+        "CREATE TABLE IF NOT EXISTS category_sizes ("
+        "category TEXT PRIMARY KEY, products INTEGER NOT NULL, checked_at INTEGER NOT NULL)"
+    )
+    db.execute(
         "CREATE TABLE IF NOT EXISTS progress ("
         "brand TEXT, category TEXT, next_page INTEGER NOT NULL, last_sku TEXT, "
         "done INTEGER NOT NULL, max_page INTEGER NOT NULL DEFAULT 1, "
@@ -362,13 +366,44 @@ async def measure_brands(client, guard, db, brands: list[str]) -> dict[str, int]
     return sizes
 
 
-def order_pending(brands, categories, popular, done, sizes=None):
-    """Biggest catalogues first when sizes are known, otherwise popular brands first."""
+def save_category_size(db: sqlite3.Connection, category: str, products: int) -> None:
+    db.execute(
+        "INSERT OR REPLACE INTO category_sizes (category, products, checked_at) VALUES (?, ?, ?)",
+        (category, products, int(time.time())),
+    )
+    db.commit()
+
+
+def read_category_sizes(db: sqlite3.Connection) -> dict[str, int]:
+    return dict(db.execute("SELECT category, products FROM category_sizes"))
+
+
+async def measure_categories(client, guard, db, categories: list[str]) -> dict[str, int]:
+    sizes = read_category_sizes(db)
+    missing = [c for c in categories if c not in sizes]
+    for index, category in enumerate(missing, 1):
+        response = await get(client, f"{BASE}/de/ersatzteile/{category}", guard, {"db": db})
+        if response is None or response.status_code != 200:
+            continue
+        size = parse_brand_size(response.text) or 0
+        save_category_size(db, category, size)
+        sizes[category] = size
+        if index % 100 == 0:
+            print(f"measured categories {index}/{len(missing)}", flush=True)
+    return sizes
+
+
+def order_pending(brands, categories, popular, done, sizes=None, cat_sizes=None):
+    """Biggest brands first; within a brand, densest categories first."""
     if sizes:
         ordered = sorted(brands, key=lambda b: (-sizes.get(b, 0), b))
     else:
         ordered = [b for b in brands if b in popular] + [b for b in brands if b not in popular]
-    return [(b, c) for b in ordered for c in categories if (b, c) not in done]
+    ordered_categories = (
+        sorted(categories, key=lambda c: (-cat_sizes.get(c, 0), c))
+        if cat_sizes else categories
+    )
+    return [(b, c) for b in ordered for c in ordered_categories if (b, c) not in done]
 
 
 async def discover(client: httpx.AsyncClient, *, guard=None) -> tuple[list[str], list[str], set[str]]:
@@ -516,11 +551,17 @@ async def run(args) -> None:
             wanted = {b.strip() for b in args.brands.split(",")}
             brands = [b for b in brands if b in wanted]
         sizes = None
+        cat_sizes = None
         if args.order_by_size:
             sizes = await measure_brands(client, guard, db, brands)
             top = sorted(sizes.items(), key=lambda item: -item[1])[:5]
             print(f"brand sizes: " + ", ".join(f"{b}={n}" for b, n in top), flush=True)
-        pending = order_pending(brands, categories, popular, done, sizes=sizes)
+            cat_sizes = await measure_categories(client, guard, db, categories)
+            top_cats = sorted(cat_sizes.items(), key=lambda item: -item[1])[:5]
+            print(f"category sizes: " + ", ".join(f"{c}={n}" for c, n in top_cats), flush=True)
+        pending = order_pending(
+            brands, categories, popular, done, sizes=sizes, cat_sizes=cat_sizes,
+        )
         print(
             f"{len(pending):,} listings pending "
             f"({len(brands):,} brands x {len(categories):,} categories), "
