@@ -458,6 +458,7 @@ async def scrape_combo(
         return
     page, previous_first_sku = checkpoint[:2] if checkpoint else (1, None)
     expected_last_page = checkpoint[3] if checkpoint else 1
+    duplicate_pages = 0
     while True:
         url = BASE + LISTING.format(brand=brand, category=category, page=page)
         response = await get(client, url, guard, state)
@@ -499,9 +500,14 @@ async def scrape_combo(
         previous_first_sku = rows[0]["sku"]
 
         async with state["lock"]:
-            done = page >= expected_last_page
             with state["db"]:
                 inserted = save_rows(state["db"], rows)
+                duplicate_pages = 0 if inserted else duplicate_pages + 1
+                saturated = (
+                    (page == 1 and not inserted and expected_last_page > 1)
+                    or duplicate_pages >= 2
+                )
+                done = page >= expected_last_page or saturated
                 state["db"].execute(
                     "INSERT OR REPLACE INTO progress "
                     "(brand, category, next_page, last_sku, done, max_page) VALUES (?, ?, ?, ?, ?, ?)",

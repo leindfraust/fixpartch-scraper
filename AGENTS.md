@@ -34,10 +34,12 @@ uv run fixpart.py --db fixpart.db --export products.csv
 2. **Rate ceiling.** ~100 requests/minute per IP is the measured limit; 1.6 req/s is the
    operating point. A 429 parks all requests for 30 s (or `Retry-After`).
 3. **Never delete product rows.** Resume by skipping verified work, not by clearing tables.
-4. **Completion is earned.** A listing is `done` only when every advertised page has been
-   fetched, or the site explicitly shows an empty result (`Filter 0 Ergebnisse`), or a
-   later page is an empty listing shell. Server errors, missing `ItemList`, repeated pages,
-   and page caps leave a listing pending.
+4. **Completion is earned.** A listing is `done` when every advertised page has been
+   fetched, the site explicitly shows an empty result (`Filter 0 Ergebnisse`), a later page
+   is an empty listing shell, or the listing is **saturated** — its first page added no new
+   SKUs, or two consecutive pages added none, because the same parts are already known
+   under compatible brands. Server errors, missing `ItemList`, repeated pages and page caps
+   leave a listing pending.
 5. **Never filter by the brand page's category grid.** It is a curated subset: Beko shows
    12 categories while `beko/abdeckkappe` alone has 748 products.
 6. **One crawler per database.** `fixpart.lock` holds the PID; a stale lock is reclaimed
