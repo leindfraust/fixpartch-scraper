@@ -394,7 +394,12 @@ async def measure_categories(client, guard, db, categories: list[str]) -> dict[s
 
 
 def order_pending(brands, categories, popular, done, sizes=None, cat_sizes=None):
-    """Biggest brands first; within a brand, densest categories first."""
+    """Order by expected yield per request: brand claim x category density."""
+    if sizes and cat_sizes:
+        pairs = [(b, c) for b in brands for c in categories if (b, c) not in done]
+        return sorted(
+            pairs, key=lambda bc: (-(sizes.get(bc[0], 0) * cat_sizes.get(bc[1], 0)), bc),
+        )
     if sizes:
         ordered = sorted(brands, key=lambda b: (-sizes.get(b, 0), b))
     else:
